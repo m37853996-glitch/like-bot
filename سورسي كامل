@@ -1,0 +1,1687 @@
+// ==========================================
+// 📌 القسم الأول: الإعدادات، المتغيرات، والدوال الأساسية
+// ==========================================
+const { Telegraf, Markup } = require("telegraf");
+const fs = require("fs");
+const path = require("path");
+const axios = require("axios");
+
+const bot = new Telegraf("9292674321:AAGTJN7e7FMpTdZAnbIIBzAHCW8xDvXICrw");
+const CHANNEL_USERNAME = "@Michaelm4kk";
+const DEVELOPER_ID = "8988529781";
+
+const dbPath = path.join(__dirname, "cooldowns.json");
+const dataPath = path.join(__dirname, "bot_data.json");
+const accountsPath = path.join(__dirname, "accounts.txt");
+
+let userLikeCooldowns = fs.existsSync(dbPath) ? JSON.parse(fs.readFileSync(dbPath, "utf8")) : {};
+function saveCooldowns() { fs.writeFileSync(dbPath, JSON.stringify(userLikeCooldowns, null, 2)); }
+
+let botData = {
+  activeUsers: ["8988529781"],
+  activeGroups: ["-1004308451962"],
+  disabledGroups: [],
+  admins: ["8988529781"],
+  userGroups: {},
+  notifiedUsers: [],
+  groupExpiry: {},
+  userExpiry: {},
+  codes: {},
+  groupDailyCooldowns: {},
+  autoLikes: {},
+  accountBatchIndex: 0,
+  groupActivationTimes: {},
+  groupExpiryNotified: [],
+  userExpiryNotified: [],
+  groupLeavedGroups: {},
+  groupJoinRecords: {},
+  trialsClaimed: [],
+  targetCooldowns: {},
+  trialStartTimes: {},
+  userPermissions: {},
+  botStatus: "work",
+  stopMessage: ""
+};
+
+const processingUsers = new Set();
+const taskQueue = [];
+let isProcessingQueue = false;
+
+const MAX_QUEUE_SIZE = 30;
+const QUEUE_DELAY_MS = 300;
+
+function enqueueLikeTask(targetUid) {
+  return new Promise((resolve, reject) => {
+    targetUid = String(targetUid).trim();
+    if (processingUsers.has(targetUid)) {
+      return reject(new Error("DUPLICATE_UID"));
+    }
+    if (taskQueue.length >= MAX_QUEUE_SIZE) {
+      return reject(new Error("QUEUE_FULL"));
+    }
+    processingUsers.add(targetUid);
+    taskQueue.push({ targetUid, resolve, reject });
+    processQueue();
+  });
+}
+
+async function processQueue() {
+  if (isProcessingQueue || taskQueue.length === 0) return;
+  isProcessingQueue = true;
+  const task = taskQueue.shift();
+  try {
+    const result = await sendLikesApiDirect(task.targetUid);
+    task.resolve(result);
+  } catch (err) {
+    task.reject(err);
+  } finally {
+    processingUsers.delete(task.targetUid);
+    isProcessingQueue = false;
+    setTimeout(processQueue, QUEUE_DELAY_MS);
+  }
+}
+
+if (fs.existsSync(dataPath)) {
+  try {
+    const loaded = JSON.parse(fs.readFileSync(dataPath, "utf8"));
+    Object.assign(botData, loaded);
+  } catch (e) {}
+}
+
+function saveData() { fs.writeFileSync(dataPath, JSON.stringify(botData, null, 2)); }
+const isAdmin = (id) => botData.admins.includes(id.toString());
+const isDev = (id) => id.toString() === DEVELOPER_ID;
+
+function escapeMarkdown(text) {
+  if (!text) return "";
+  return text.toString()
+    .replace(/\\/g, '\\\\')
+    .replace(/_/g, '\\_')
+    .replace(/\*/g, '\\*')
+    .replace(/`/g, '\\`')
+    .replace(/\[/g, '\\[') .replace(/\]/g, '\\]')
+    .replace(/\(/g, '\\(') .replace(/\)/g, '\\)');
+}
+
+function getAccounts() {
+  if (!fs.existsSync(accountsPath)) return [];
+  const data = fs.readFileSync(accountsPath, "utf8");
+  return data.split("\n").map(acc => acc.trim()).filter(acc => acc.length > 0);
+}
+
+async function checkSubscription(ctx, userId) {
+  if (userId === DEVELOPER_ID) return true;
+  try {
+    const member = await ctx.telegram.getChatMember(CHANNEL_USERNAME, userId);
+    return ['creator', 'administrator', 'member'].includes(member.status);
+  } catch (e) {
+    return false;
+  }
+}
+
+function isUserActive(userId) {
+  if (isAdmin(userId)) return true;
+  if (!botData.activeUsers.includes(userId)) return false;
+  
+  let hasValidCode = false;
+  let hasAnyUsedCode = false;
+  for (const [codeKey, codeObj] of Object.entries(botData.codes || {})) {
+    if (codeObj.usedBy === userId) {
+      hasAnyUsedCode = true;
+      if (!codeObj.revoked && !codeObj.cloaked) {
+        hasValidCode = true;
+        break;
+      }
+    }
+  }
+  if (hasAnyUsedCode && !hasValidCode) {
+    return false;
+  }
+
+  const expiry = botData.userExpiry[userId];
+  if (expiry && expiry < Date.now()) return false;
+  return true;
+}
+
+const TRIAL_DURATION_MS = 60 * 60 * 1000;
+
+function isTrialActive(userId) {
+  const start = botData.trialStartTimes && botData.trialStartTimes[userId];
+  return !!start && (Date.now() - start) < TRIAL_DURATION_MS;
+}
+
+function isGroupActive(chatId) {
+  if (!botData.activeGroups.includes(chatId)) return false;
+  const expiry = botData.groupExpiry[chatId];
+  if (expiry && expiry < Date.now()) return false;
+  return true;
+}
+
+async function isGroupAdmin(ctx) {
+  try {
+    const userId = ctx.from.id.toString();
+    if (isDev(userId) || isAdmin(userId)) return true;
+    const m = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+    return m.status === 'creator' || m.status === 'administrator';
+  } catch (e) { return false; }
+}
+
+async function sendLikesApiDirect(targetUid) {
+  const allAccounts = getAccounts();
+  let currentBatch = [];
+
+  if (allAccounts.length > 0) {
+    const batchSize = 220;
+    const totalBatches = Math.ceil(allAccounts.length / batchSize);
+    if (botData.accountBatchIndex >= totalBatches) botData.accountBatchIndex = 0;
+    const start = botData.accountBatchIndex * batchSize;
+    currentBatch = allAccounts.slice(start, start + batchSize);
+    botData.accountBatchIndex = (botData.accountBatchIndex + 1) % totalBatches;
+    saveData();
+  }
+
+  const beforeRes = await axios.get("http://de26.spaceify.eu:26080/info", { params: { uid: targetUid }, timeout: 15000 });
+  if (!beforeRes || !beforeRes.data || !beforeRes.data.basicInfo || !beforeRes.data.basicInfo.nickname) {
+    throw new Error("INVALID_UID");
+  }
+  
+  const bInfo = beforeRes.data.basicInfo;
+  const beforeLikes = bInfo.liked || 0;
+  const nickname = escapeMarkdown(bInfo.nickname);
+  const playerLevel = bInfo.level || bInfo.lvl || "غير معروف";
+
+  try {
+    await axios.get("http://de26.spaceify.eu:26080/like", { params: { uid: targetUid, accounts: currentBatch.join(",") }, timeout: 25000 });
+  } catch (e) {}
+
+  const afterRes = await axios.get("http://de26.spaceify.eu:26080/info", { params: { uid: targetUid }, timeout: 15000 });
+  const afterLikes = (afterRes && afterRes.data && afterRes.data.basicInfo) ? (afterRes.data.basicInfo.liked || beforeLikes) : beforeLikes;
+  const addedLikes = afterLikes >= beforeLikes ? (afterLikes - beforeLikes) : 0;
+
+  return { nickname, playerLevel, beforeLikes, afterLikes, addedLikes };
+}
+
+function checkGlobalTargetCooldown(targetUid) {
+  if (!botData.targetCooldowns) botData.targetCooldowns = {};
+  const targetLastTime = botData.targetCooldowns[targetUid] || 0;
+  const targetCooldownTime = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  
+  if (now - targetLastTime < targetCooldownTime) {
+    const targetRemaining = targetCooldownTime - (now - targetLastTime);
+    const tHours = Math.floor(targetRemaining / (1000 * 60 * 60));
+    const tMins = Math.floor((targetRemaining % (1000 * 60 * 60)) / (1000 * 60));
+    return { limited: true, hours: tHours, mins: tMins };
+  }
+  return { limited: false };
+}
+
+function updateGlobalTargetCooldown(targetUid) {
+  if (!botData.targetCooldowns) botData.targetCooldowns = {};
+  botData.targetCooldowns[targetUid] = Date.now();
+  saveData();
+}
+
+function getUserPermission(userId) {
+  if (isDev(userId) || isAdmin(userId)) return "all";
+  return botData.userPermissions && botData.userPermissions[userId] ? botData.userPermissions[userId] : "all";
+}
+
+async function processRedeem(ctx, codeText) {
+  const code = codeText.trim();
+  if (!botData.codes[code]) return ctx.reply("❌ الكود غير صحيح أو غير موجود.");
+  if (botData.codes[code].used) return ctx.reply("❌ تم استخدام هذا الكود مسبقاً.");
+
+  const userId = ctx.from.id.toString();
+  const userName = ctx.from.first_name || "مستخدم";
+  const codeData = botData.codes[code];
+  
+  codeData.used = true;
+  codeData.usedBy = userId;
+  codeData.usedByName = userName;
+  codeData.revoked = false;
+
+  const now = Date.now();
+  const currentExpiry = (botData.userExpiry[userId] && botData.userExpiry[userId] > now) ? botData.userExpiry[userId] : now;
+  const newExpiry = currentExpiry + codeData.durationMs;
+
+  botData.userExpiry[userId] = newExpiry;
+  if (!botData.activeUsers.includes(userId)) botData.activeUsers.push(userId);
+  
+  if (!botData.userPermissions) botData.userPermissions = {};
+  botData.userPermissions[userId] = codeData.permission || "all";
+  
+  if (botData.userExpiryNotified) {
+    botData.userExpiryNotified = botData.userExpiryNotified.filter(id => id !== userId);
+  }
+  
+  saveData();
+
+  const successMsg = 
+    `🎟️ *تم استخدام كود تفعيل بنجاح!*\n\n` +
+    `👤 المستخدم: ${userName}\n` +
+    `🆔 الآيدي: \`${userId}\`\n` +
+    `🔑 نوع الصلاحية: \`${codeData.permission || 'all'}\`\n` +
+    `🔑 الكود المستهلك: \`${code}\``;
+
+  bot.telegram.sendMessage(DEVELOPER_ID, successMsg, { parse_mode: "Markdown" }).catch(() => {});
+
+  if (codeData.createdBy && codeData.createdBy !== DEVELOPER_ID) {
+    bot.telegram.sendMessage(codeData.createdBy, successMsg, { parse_mode: "Markdown" }).catch(() => {});
+  }
+
+  return ctx.replyWithMarkdown(`🎉 مبروك! تم تفعيل اشتراكك بنجاح (نوع الصلاحية: ${codeData.permission || 'all'}) حتى: ${new Date(newExpiry).toLocaleString()}`);
+}
+// ==========================================
+// 📌 القسم الثاني: الأوامر، المعالجات، والتشغيل
+// ==========================================
+
+setInterval(async () => {
+  try {
+    const now = Date.now();
+    if (!botData.groupExpiryNotified) botData.groupExpiryNotified = [];
+    if (!botData.userExpiryNotified) botData.userExpiryNotified = [];
+
+    for (const uId of Object.keys(botData.userExpiry || {})) {
+      if (uId === DEVELOPER_ID || isAdmin(uId)) continue;
+      const expiry = botData.userExpiry[uId];
+      if (expiry && expiry <= now) {
+        if (!botData.userExpiryNotified.includes(uId)) {
+          botData.userExpiryNotified.push(uId);
+          
+          const expiredMsg = 
+            `╭━━━ ⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀 ━━━╮\n\n` +
+            `⚠️ عزيزي المستخدم، نحيطك علماً بانتهاء مدة اشتراكك في البوت.\n\n` +
+            `🔒 تم إيقاف صلاحية الوصول إلى الخدمات لانتهاء فترة التفعيل.\n\n` +
+            `🔑 لتجديد اشتراكك، يرجى التواصل مع المطور: @m4kk6\n\n` +
+            `╰━━━━━━━━━━━━━━━━━━━━╯`;
+
+          const expiryKeyboard = Markup.inlineKeyboard([
+            [Markup.button.callback("🎟️ إدخال كود الاشتراك", "enter_code")],
+            [Markup.button.url("💬 التواصل مع المطور", "https://t.me/m4kk6")]
+          ]);
+
+          const startImg = "https://i.postimg.cc/HjGfMjSY/dcfd304bbad41cf055f2c9031a8d04c8.jpg";
+          await bot.telegram.sendPhoto(uId, startImg, { caption: expiredMsg, parse_mode: "Markdown", ...expiryKeyboard }).catch(() => {});
+          saveData();
+        }
+      }
+    }
+
+    for (const gId of [...botData.activeGroups]) {
+      const expiry = botData.groupExpiry[gId];
+      if (expiry && expiry <= now) {
+        if (!botData.groupExpiryNotified.includes(gId)) {
+          botData.groupExpiryNotified.push(gId);
+          
+          const idx = botData.activeGroups.indexOf(gId);
+          if (idx !== -1) botData.activeGroups.splice(idx, 1);
+          
+          let groupLink = "بدون رابط";
+          let totalDurationStr = "غير معروف";
+          
+          if (botData.groupJoinRecords && botData.groupJoinRecords[gId]) {
+            groupLink = botData.groupJoinRecords[gId].username || "بدون رابط";
+          }
+          if (botData.groupActivationTimes && botData.groupActivationTimes[gId]) {
+            const totalMs = expiry - botData.groupActivationTimes[gId];
+            const totalMins = Math.floor(totalMs / (1000 * 60));
+            const totalHours = Math.floor(totalMins / 60);
+            const totalDays = Math.floor(totalHours / 24);
+            
+            if (totalDays > 0) totalDurationStr = `${totalDays} يوم`;
+            else if (totalHours > 0) totalDurationStr = `${totalHours} ساعة`;
+            else totalDurationStr = `${totalMins} دقيقة`;
+          }
+
+          const groupMsg = 
+            `⚠️ انتهت مدة اشتراك المجموعة\n\n` +
+            `🔗 رابط المجموعة: ${groupLink}\n\n` +
+            `⏳ مدة العمل داخل المجموعه: ${totalDurationStr}\n\n` +
+            `🔑 للتجديد: @m4kk6\n\n` +
+            `🔒 تم إيقاف خدمات البوت في المجموعة لانتهاء الاشتراك.\n\n` +
+            `⚡ MICHAEL ELITE`;
+          
+          await bot.telegram.sendMessage(gId, groupMsg, { parse_mode: "Markdown" }).catch(() => {});
+
+          let ownerId = null;
+          for (const [uId, gList] of Object.entries(botData.userGroups || {})) {
+            if (gList.includes(gId)) {
+              ownerId = uId;
+              break;
+            }
+          }
+
+          if (ownerId) {
+            const clientMsg = 
+              `انتهى مده اشتراك📌\n` +
+              `رابط القروب: ${groupLink}\n` +
+              `المده: ${totalDurationStr}\n` +
+              `تم ارسال رساله الانتهاء بنجاح`;
+
+            await bot.telegram.sendMessage(ownerId, clientMsg, { parse_mode: "Markdown" }).catch(() => {});
+          }
+
+          saveData();
+        }
+      }
+    }
+  } catch (e) {}
+}, 30 * 1000);
+
+bot.use(async (ctx, next) => {
+  try {
+    if (ctx.chat && (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup' || ctx.chat.type === 'channel')) {
+      const chatId = ctx.chat.id.toString();
+      const chatTitle = ctx.chat.title || "مجموعة/قناة";
+      const chatUsername = ctx.chat.username ? `@${ctx.chat.username}` : (ctx.chat.invite_link || "بدون معرف");
+      if (!botData.groupJoinRecords[chatId]) {
+        botData.groupJoinRecords[chatId] = { title: chatTitle, username: chatUsername, joinedAt: Date.now() };
+        saveData();
+      }
+    }
+  } catch (e) {}
+  return next();
+});
+
+bot.use(async (ctx, next) => {
+  if (ctx.chat && ctx.chat.type === 'private') {
+    const userId = ctx.from.id.toString();
+    if (userId === DEVELOPER_ID) return next();
+    if (ctx.callbackQuery) {
+      const data = ctx.callbackQuery.data;
+      if (data === "check_subscription" || data === "enter_code" || data === "goto_spam" || data === "back_to_main") return next();
+    }
+    
+    const isSubscribed = await checkSubscription(ctx, userId);
+    if (!isSubscribed) {
+      const subMsg = 
+        `⚡ أهلاً بك في عالم MICHAEL ELITE\n\n` +
+        `يسعدنا انضمامك إلينا، لكن عذراً عزيزي، الوصول إلى البوت يتطلب الاشتراك في قناتنا الرسمية أولاً.\n\n` +
+        `✦ قناة الاشتراك الرسمية:\n` +
+        `https://t.me/Michaelm4kk\n\n` +
+        `🔒 اشترك في القناة ثم اضغط على زر التحقق لفتح البوت والاستمتاع بالخدمات.\n\n` +
+        `MICHAEL ELITE | حيث تبدأ القوة ⚡`;
+
+      const subKeyboard = Markup.inlineKeyboard([
+        [Markup.button.url("📢 اشترك في القناة", "https://t.me/Michaelm4kk")],
+        [Markup.button.callback("✅ التحقق من الاشتراك", "check_subscription")]
+      ]);
+      return ctx.reply(subMsg, { parse_mode: "Markdown", ...subKeyboard }).catch(() => {});
+    }
+  }
+  return next();
+});
+
+bot.action("check_subscription", async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const isSubscribed = await checkSubscription(ctx, userId);
+  if (isSubscribed) {
+    await ctx.answerCbQuery("✅ تم التحقق من اشتراكك بنجاح! أهلاً بك.", { show_alert: false });
+    try { await ctx.deleteMessage(); } catch (e) {}
+    
+    if (botData.botStatus === "stop1" || botData.botStatus === "stop2") {
+      return ctx.reply(botData.stopMessage, { parse_mode: "Markdown" });
+    }
+
+    return ctx.reply("🎉 تم تأكيد اشتراكك بنجاح! أرسل /start لفتح لوحة التحكم.");
+  } else {
+    return ctx.answerCbQuery("❌ عذراً، أنت لم تشترك في القناة حتى الآن! يرجى الاشتراك أولاً.", { show_alert: true });
+  }
+});
+
+bot.action("goto_spam", async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id.toString();
+  const perm = getUserPermission(userId);
+  if (perm === "like") {
+    return ctx.answerCbQuery("❌ عذراً، هذا القسم غير متاح لصلاحية حسابك.", { show_alert: true });
+  }
+
+  const spamImg = "https://i.postimg.cc/dVHJwpDz/a51f6398e0626aa6794bc907b596a02e.jpg";
+  const spamTxt = 
+    `🤖 *SPAM BOT*\n\n` +
+    `╭───────────────╮\n` +
+    `⚡ MICHAEL ELITE\n` +
+    `╰───────────────╯\n\n` +
+    `🎯 أوامر المستخدمين\n\n` +
+    `/spam \`<uid>\`\n↳ سبام دعوات فريق 6 ساعات\n\n` +
+    `/nospam \`<uid>\`\n↳ ازاله سبام دعوات فريق\n\n` +
+    `/spam_ff \`<uid>\`\n↳ سبام طلبات صداقه 6 ساعات\n\n` +
+    `/nospam_ff \`<uid>\`\n↳ ازاله سبام طلبات صداقه\n\n` +
+    `/5\n↳ فتح فريق 5\n\n` +
+    `/6\n↳ فتح فريق 6\n\n` +
+    `💳 Credit: @m4kk6`;
+
+  const spamKeyboard = Markup.inlineKeyboard([
+    [Markup.button.callback("◀️ العودة للقائمة الرئيسية", "back_to_main")]
+  ]);
+
+  try {
+    await ctx.editMessageMedia({ type: 'photo', media: spamImg, caption: spamTxt, parse_mode: 'Markdown' }, { ...spamKeyboard });
+  } catch (e) {
+    await ctx.replyWithPhoto(spamImg, { caption: spamTxt, parse_mode: 'Markdown', ...spamKeyboard }).catch(() => {});
+  }
+});
+
+bot.action("back_to_main", async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id.toString();
+  const perm = getUserPermission(userId);
+  const startImg = "https://i.postimg.cc/HjGfMjSY/dcfd304bbad41cf055f2c9031a8d04c8.jpg";
+  
+  if (perm === "spam") {
+    const spamTxt = 
+      `🤖 *SPAM BOT*\n\n` +
+      `╭───────────────╮\n` +
+      `⚡ MICHAEL ELITE\n` +
+      `╰───────────────╯\n\n` +
+      `🎯 أوامر المستخدمين\n\n` +
+      `/spam \`<uid>\`\n↳ سبام دعوات فريق 6 ساعات\n\n` +
+      `/nospam \`<uid>\`\n↳ ازاله سبام دعوات فريق\n\n` +
+      `/spam_ff \`<uid>\`\n↳ سبام طلبات صداقه 6 ساعات\n\n` +
+      `/nospam_ff \`<uid>\`\n↳ ازاله سبام طلبات صداقه\n\n` +
+      `/5\n↳ فتح فريق 5\n\n` +
+      `/6\n↳ فتح فريق 6\n\n` +
+      `💳 Credit: @m4kk6`;
+    try {
+      return await ctx.editMessageMedia({ type: 'photo', media: "https://i.postimg.cc/dVHJwpDz/a51f6398e0626aa6794bc907b596a02e.jpg", caption: spamTxt, parse_mode: 'Markdown' });
+    } catch (e) {
+      return await ctx.replyWithPhoto("https://i.postimg.cc/dVHJwpDz/a51f6398e0626aa6794bc907b596a02e.jpg", { caption: spamTxt, parse_mode: 'Markdown' }).catch(() => {});
+    }
+  }
+
+  let txt = "🤖 *LIKE BOT*\n\n" +
+            "╭───────────────╮\n" +
+            "⚡ MICHAEL ELITE\n" +
+            "╰───────────────╯\n\n" +
+            "🎯 *أوامر المستخدمين*\n\n" +
+            "/like `<uid>`\n↳ إرسال اللايكات\n\n" +
+            "/likeauto `<uid>` `<days>`\n↳ تفعيل الأوتو لايك\n\n" +
+            "/removeauto `<uid>` `<days>`\n↳ إيقاف الأوتو لايك\n\n" +
+            "/groups\n↳ عرض القروبات المفعّلة\n\n";
+  
+  if (isAdmin(userId) && !isDev(userId)) {
+    txt += "━━━━━━━━━━━━━━\n\n" +
+           "⚙️ *أوامر الأدمن*\n\n" +
+           "/gencode `<مدة> <like/spam/all>`\n↳ توليد كود اشتراك\n\n" +
+           "/codes\n↳ عرض الأكواد النشطة\n\n" +
+           "/cloak `<code>`\n↳ إتلاف كود اشتراك\n\n";
+  }
+
+  if (isDev(userId)) {
+    txt += "━━━━━━━━━━━━━━\n\n" +
+           "⚙️ *أوامر المطور والأدمن*\n\n" +
+           "/work\n↳ تشغيل البوت\n\n" +
+           "/stop 1 أو /stop 2\n↳ إيقاف البوت برسالة صيانة أو انتهاء العمل\n\n" +
+           "/gencode `<مدة> <like/spam/all>`\n↳ توليد كود اشتراك\n\n" +
+           "/codes\n↳ عرض جميع الأكواد النشطة\n\n" +
+           "/cloak `<code>`\n↳ إتلاف كود اشتراك\n\n" +
+           "/users\n↳ عرض الحسابات المفعّلة\n\n" +
+           "/Users\n↳ عرض كافة المستخدمين (أدمن وعاديين)\n\n" +
+           "/Groups\n↳ عرض المجموعات وحالة تفعيلها\n\n" +
+           "/Admin\n↳ عرض قائمة الأدمنية\n\n" +
+           "/addgroup `<group_id_or_link>` `<user_id>` `<duration>`\n↳ تفعيل قروب\n\n" +
+           "/remgroup `<group_id_or_link>`\n↳ إزالة قروب\n\n" +
+           "/addadmin `<id>`\n↳ إضافة أدمن\n\n" +
+           "/remadmin `<id>`\n↳ إزالة أدمن\n\n";
+  }
+  
+  txt += "━━━━━━━━━━━━━━\n\n" +
+         "💳 Credit: @m4kk6";
+
+  const keyboardButtons = [];
+  if (perm !== "like") {
+    keyboardButtons.push([Markup.button.callback("🚀 الانتقال الى قسم الاسبام", "goto_spam")]);
+  }
+  const mainKeyboard = Markup.inlineKeyboard(keyboardButtons);
+
+  try {
+    await ctx.editMessageMedia({ type: 'photo', media: startImg, caption: txt, parse_mode: 'Markdown' }, { ...mainKeyboard });
+  } catch (e) {
+    await ctx.replyWithPhoto(startImg, { caption: txt, parse_mode: 'Markdown', ...mainKeyboard }).catch(() => {});
+  }
+});
+
+bot.telegram.setMyCommands([
+  { command: 'start', description: 'تشغيل البوت / عرض القائمة' },
+  { command: 'id', description: 'معرفة الآيدي' }
+], { scope: { type: 'all_private_chats' } });
+
+bot.telegram.setMyCommands([
+  { command: 'start', description: 'تشغيل البوت' }
+], { scope: { type: 'all_group_chats' } });
+
+bot.start(async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const chatId = ctx.chat.id.toString();
+  const chatType = ctx.chat.type;
+  const userName = ctx.from.first_name || "مستخدم";
+  const startImg = "https://i.postimg.cc/HjGfMjSY/dcfd304bbad41cf055f2c9031a8d04c8.jpg";
+
+  if (chatType === 'supergroup' || chatType === 'group' || chatType === 'channel') {
+    // ⚡ فحص دقيق: هل المجموعة غير مفعلة؟
+    if (!isGroupActive(chatId) || botData.disabledGroups.includes(chatId)) {
+      if (userId === DEVELOPER_ID) {
+        const devExpiredMsg = 
+          `😂⚠️ عزيزي المطور، الظاهر أن البوت قرر يأخذ إجازة من هذا القروب، شكله ما عاد يتحمل الإزعاج! 🤣\n\n` +
+          `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`;
+        return ctx.reply(devExpiredMsg);
+      } else {
+        const insufficientMsg = 
+          `⛔ تنبيه | INSUFFICIENT PERMISSIONS\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n\n` +
+          `⚠️ البوت لا يمتلك الصلاحيات المطلوبة للعمل داخل هذه المجموعة أو أن الاشتراك منتهي.\n\n` +
+          `🛠️ الإجراء المطلوب:\n` +
+          `يرجى التأكد من تفعيل المجموعة لدى المطور.\n\n` +
+          `👨‍💻 المطور: @m4kk6\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`;
+        return ctx.reply(insufficientMsg);
+      }
+    }
+
+    // المجموعة مفعلة: فحص ما إذا كان المرسل مشرفاً أم عضواً عادياً
+    const userIsAdmin = await isGroupAdmin(ctx);
+    if (!userIsAdmin) {
+      return ctx.reply(`😂 يا حبيبنا، من متى صرت مشرف؟ تراك عضو عادي وجاي تأخذ حقوق المشرفين بعد! 🤣\n\n⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`);
+    }
+    
+    let grpTxt = "🤖 LIKE BOT\n\n" +
+                 "/like <uid>\n" +
+                 "اوامر الادمن🎯\n" +
+                 "/on\n" +
+                 "/off\n" +
+                 "/period";
+    
+    return ctx.replyWithPhoto(startImg, { caption: grpTxt, parse_mode: "Markdown" }).catch(() => ctx.replyWithMarkdown(grpTxt));
+  }
+
+  if (chatType === 'private' && userId !== DEVELOPER_ID) {
+    if (!botData.trialsClaimed.includes(userId)) {
+      botData.trialsClaimed.push(userId);
+      saveData();
+    }
+    if (!botData.notifiedUsers.includes(userId)) {
+      botData.notifiedUsers.push(userId);
+      saveData();
+      await ctx.telegram.sendMessage(
+        DEVELOPER_ID,
+        `🚨 *شخص جديد دخل إلى البوت لأول مرة!*\n\n👤 الاسم: ${userName}\n🆔 الآيدي: \`${userId}\``,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+    }
+  }
+
+  if (chatType === 'private' && botData.botStatus !== "work" && userId !== DEVELOPER_ID) {
+    return ctx.reply(botData.stopMessage, { parse_mode: "Markdown" });
+  }
+
+  if (chatType === 'private') {
+    if (isUserActive(userId)) {
+      const perm = getUserPermission(userId);
+
+      if (perm === "spam") {
+        const spamImgUrl = "https://i.postimg.cc/dVHJwpDz/a51f6398e0626aa6794bc907b596a02e.jpg";
+        const spamTxt = 
+          `🤖 *SPAM BOT*\n\n` +
+          `╭───────────────╮\n` +
+          `⚡ MICHAEL ELITE\n` +
+          `╰───────────────╯\n\n` +
+          `🎯 أوامر المستخدمين\n\n` +
+          `/spam \`<uid>\`\n↳ سبام دعوات فريق 6 ساعات\n\n` +
+          `/nospam \`<uid>\`\n↳ ازاله سبام دعوات فريق\n\n` +
+          `/spam_ff \`<uid>\`\n↳ سبام طلبات صداقه 6 ساعات\n\n` +
+          `/nospam_ff \`<uid>\`\n↳ ازاله سبام طلبات صداقه\n\n` +
+          `/5\n↳ فتح فريق 5\n\n` +
+          `/6\n↳ فتح فريق 6\n\n` +
+          `💳 Credit: @m4kk6`;
+        return ctx.replyWithPhoto(spamImgUrl, { caption: spamTxt, parse_mode: 'Markdown' }).catch(() => ctx.replyWithMarkdown(spamTxt));
+      }
+
+      let txt = "🤖 *LIKE BOT*\n\n" +
+                "╭───────────────╮\n" +
+                "⚡ MICHAEL ELITE\n" +
+                "╰───────────────╯\n\n" +
+                "🎯 *أوامر المستخدمين*\n\n" +
+                "/like `<uid>`\n↳ إرسال اللايكات\n\n" +
+                "/likeauto `<uid>` `<days>`\n↳ تفعيل الأوتو لايك\n\n" +
+                "/removeauto `<uid>` `<days>`\n↳ إيقاف الأوتو لايك\n\n" +
+                "/groups\n↳ عرض القروبات المفعّلة\n\n";
+      
+      if (isAdmin(userId) && !isDev(userId)) {
+        txt += "━━━━━━━━━━━━━━\n\n" +
+               "⚙️ *أوامر الأدمن*\n\n" +
+               "/gencode `<مدة> <like/spam/all>`\n↳ توليد كود اشتراك\n\n" +
+               "/codes\n↳ عرض الأكواد النشطة\n\n" +
+               "/cloak `<code>`\n↳ إتلاف كود اشتراك\n\n";
+      }
+
+      if (isDev(userId)) {
+        txt += "━━━━━━━━━━━━━━\n\n" +
+               "⚙️ *أوامر المطور والأدمن*\n\n" +
+               "/work\n↳ تشغيل البوت\n\n" +
+               "/stop 1 أو /stop 2\n↳ إيقاف البوت برسالة صيانة أو انتهاء العمل\n\n" +
+               "/gencode `<مدة> <like/spam/all>`\n↳ توليد كود اشتراك\n\n" +
+               "/codes\n↳ عرض جميع الأكواد النشطة\n\n" +
+               "/cloak `<code>`\n↳ إتلاف كود اشتراك\n\n" +
+               "/users\n↳ عرض الحسابات المفعّلة\n\n" +
+               "/Users\n↳ عرض كافة المستخدمين (أدمن وعاديين)\n\n" +
+               "/Groups\n↳ عرض المجموعات وحالة تفعيلها\n\n" +
+               "/Admin\n↳ عرض قائمة الأدمنية\n\n" +
+               "/addgroup `<group_id_or_link>` `<user_id>` `<duration>`\n↳ تفعيل قروب\n\n" +
+               "/remgroup `<group_id_or_link>`\n↳ إزالة قروب\n\n" +
+               "/addadmin `<id>`\n↳ إضافة أدمن\n\n" +
+               "/remadmin `<id>`\n↳ إزالة أدمن\n\n";
+      }
+      
+      txt += "━━━━━━━━━━━━━━\n\n" +
+             "💳 Credit: @m4kk6";
+
+      const keyboardButtons = [];
+      if (perm !== "like") {
+        keyboardButtons.push([Markup.button.callback("🚀 الانتقال الى قسم الاسبام", "goto_spam")]);
+      }
+      const mainKeyboard = Markup.inlineKeyboard(keyboardButtons);
+
+      return ctx.replyWithPhoto(startImg, { caption: txt, parse_mode: 'Markdown', ...mainKeyboard }).catch(() => ctx.replyWithMarkdown(txt, mainKeyboard));
+    }
+    
+    const expiryTime = botData.userExpiry[userId];
+    const hadPreviousSubscription = expiryTime && expiryTime < Date.now();
+
+    let expiredMsg = "";
+    
+    if (hadPreviousSubscription) {
+      expiredMsg = 
+        `╭━━━ ⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀 ━━━╮\n\n` +
+        `⚠️ عزيزي المستخدم، نحيطك علماً بانتهاء مدة اشتراكك في البوت.\n\n` +
+        `🔒 تم إيقاف صلاحية الوصول إلى الخدمات لانتهاء فترة التفعيل.\n\n` +
+        `🔑 لتجديد اشتراكك، يرجى التواصل مع المطور: @m4kk6\n\n` +
+        `╰━━━━━━━━━━━━━━━━━━━━╯`;
+    } else {
+      expiredMsg = 
+        `⚠️ أهلاً بك عزيزي المستخدم.\n\n` +
+        `نود إعلامك بأن بوت MICHAEL ELITE يعمل بنظام الاشتراكات المدفوعة، ولا يمكن الوصول إلى خدماته دون امتلاك اشتراك فعّال.\n\n` +
+        `💎 للحصول على اشتراك وتفعيل حسابك، يرجى التواصل مع المطور عبر المعرف التالي:\n\n` +
+        `👨🏻‍💻 @m4kk6\n\n` +
+        `شكراً لاهتمامك وثقتك بنا.\n\n` +
+        `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏É`;
+    }
+
+    return ctx.replyWithPhoto(startImg, {
+      caption: expiredMsg,
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("🎟️ إدخال كود الاشتراك", "enter_code")],
+        [Markup.button.url("💬 التواصل مع المطور", "https://t.me/m4kk6")]
+      ])
+    }).catch(() => {});
+  }
+});
+
+bot.action("enter_code", async (ctx) => {
+  await ctx.answerCbQuery();
+  return ctx.replyWithMarkdown("🎟️ *يرجى إرسال كود التفعيل الخاص بك الآن:*");
+});
+
+bot.command("work", (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ هذا الأمر مخصص للأدمن والمطور فقط.");
+  
+  botData.botStatus = "work";
+  botData.stopMessage = "";
+  saveData();
+  return ctx.reply("🟢 تم تشغيل البوت بنجاح.");
+});
+
+bot.command("stop", (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ هذا الأمر مخصص للأدمن والمطور فقط.");
+  const parts = ctx.message.text.split(" ");
+  const type = parts[1];
+
+  if (type === "1") {
+    botData.botStatus = "stop1";
+    botData.stopMessage = 
+      `╭━━━ ⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀 ━━━╮\n\n` +
+      `⚠️ عذراً عزيزي، البوت متوقف مؤقتاً لأعمال الصيانة.\n\n` +
+      `❄️ تم تجميد جميع الاشتراكات والمدد، ولن يتم احتساب أي وقت خلال فترة الصيانة.\n\n` +
+      `نقدّر تفهّمك، ونلقاك قريباً بإذن الله.\n\n` +
+      `╰━━━━━━━━━━━━━━━━━━━━╯`;
+    saveData();
+    return ctx.reply("🔴 تم إيقاف البوت (صيانة - Stop 1).");
+  } else if (type === "2") {
+    botData.botStatus = "stop2";
+    botData.stopMessage = "🌙 انتهى وقت عمل البوت لهذا اليوم، نراك غداً بإذن الله. ⚡";
+    saveData();
+    return ctx.reply("🔴 تم إيقاف البوت (انتهاء العمل - Stop 2).");
+  } else {
+    return ctx.replyWithMarkdown("⚠️ استخدام خاطئ:\nاستخدم:\n`/stop 1` (للصيانة)\n`/stop 2` (لانلهاء العمل اليومي)");
+  }
+});
+
+bot.command("redeem", async (ctx) => {
+  if (ctx.chat.type !== 'private') return ctx.reply("⚠️ استخدم هذا الأمر في الخاص فقط.");
+  const parts = ctx.message.text.split(" ");
+  if (!parts[1]) return ctx.replyWithMarkdown("⚠️ استخدام خاطئ:\n`/redeem <code>`");
+  return processRedeem(ctx, parts[1]);
+});
+
+bot.command("gencode", async (ctx) => {
+  const userId = ctx.from.id.toString();
+  if (!isAdmin(userId)) return ctx.reply("❌ هذا الأمر مخصص للأدمن والمطور فقط.");
+
+  const parts = ctx.message.text.split(/\s+/);
+  const durationArg = (parts[1] || "1d").toLowerCase();
+  const permissionArg = (parts[2] || "all").toLowerCase();
+
+  if (!["like", "spam", "all"].includes(permissionArg)) {
+    return ctx.replyWithMarkdown("❌ نوع الصلاحية غير صحيح.\nاستخدم:\n`/gencode <مدة> like`\n`/gencode <مدة> spam`\n`/gencode <مدة> all`");
+  }
+  
+  let ms = 24 * 60 * 60 * 1000;
+  let durationDesc = "1 يوم";
+  let suffix = "1D";
+
+  if (durationArg.endsWith('m')) {
+    const mins = parseInt(durationArg) || 1;
+    ms = mins * 60 * 1000;
+    durationDesc = `${mins} دقيقة`;
+    suffix = `${mins}M`;
+  } else if (durationArg.endsWith('h')) {
+    const hours = parseInt(durationArg) || 1;
+    ms = hours * 60 * 60 * 1000;
+    durationDesc = `${hours} ساعة`;
+    suffix = `${hours}H`;
+  } else if (durationArg.endsWith('d') || !isNaN(durationArg)) {
+    const days = parseInt(durationArg) || 1;
+    ms = days * 24 * 60 * 60 * 1000;
+    durationDesc = `${days} يوم`;
+    suffix = `${days}D`;
+  }
+
+  const code = `MICHAEL-${Math.random().toString(36).substring(2, 6).toUpperCase()}-${permissionArg.toUpperCase()}${suffix}`;
+  botData.codes[code] = { 
+    durationMs: ms, 
+    durationDesc, 
+    permission: permissionArg, 
+    used: false, 
+    createdBy: userId,
+    revoked: false 
+  };
+  saveData();
+
+  if (!isDev(userId)) {
+    const adminName = ctx.from.first_name || "أدمن";
+    await bot.telegram.sendMessage(
+      DEVELOPER_ID,
+      `🎟️ *تم توليد كود جديد بواسطة أدمن!*\n\n` +
+      `👤 الأدمن: ${adminName}\n` +
+      `🆔 الآيدي: \`${userId}\`\n` +
+      `🔑 الكود: \`${code}\`\n` +
+      `⏳ المدة: ${durationDesc}\n` +
+      `🛡️ الصلاحية: *${permissionArg}*`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+  }
+
+  return ctx.replyWithMarkdown(`✅ *تم توليد الكود بنجاح بالصلاحية المطلوبة:*\n🔑 \`${code}\`\n⏳ المدة: ${durationDesc}\n🛡️ الصلاحية: *${permissionArg}*`);
+});
+
+bot.command("codes", (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ للأدمن والإدارة فقط.");
+  const userId = ctx.from.id.toString();
+  
+  const unused = Object.keys(botData.codes).filter(k => {
+    const cObj = botData.codes[k];
+    if (cObj.used) return false;
+    if (isDev(userId)) return true;
+    return cObj.createdBy === userId;
+  });
+
+  if (!unused.length) return ctx.reply("📌 لا توجد أكواد نشطة.");
+  let txt = isDev(userId) ? "📋 *جميع الأكواد النشطة في البوت:*\n\n" : "📋 *الأكواد النشطة:*\n\n";
+  for (const c of unused) txt += `🔑 \`${c}\` (${botData.codes[c].durationDesc} - صلاحية: ${botData.codes[c].permission || 'all'})\n`;
+  return ctx.replyWithMarkdown(txt);
+});
+
+bot.command("cloak", (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ للأدمن والإدارة فقط.");
+  const userId = ctx.from.id.toString();
+  const code = (ctx.message.text.split(" ")[1] || "").trim();
+  
+  if (!code || !botData.codes[code]) return ctx.reply("❌ الكود غير موجود.");
+  
+  if (!isDev(userId) && botData.codes[code].createdBy !== userId) {
+    return ctx.reply("❌ عذراً، لا يمكنك إتلاف أو مسح كود لم تقم أنت بتوليده!");
+  }
+
+  const codeData = botData.codes[code];
+  codeData.used = true;
+  codeData.revoked = true;
+
+  if (codeData.usedBy) {
+    const targetUserId = codeData.usedBy.toString();
+    if (targetUserId !== DEVELOPER_ID && !isAdmin(targetUserId)) {
+      if (botData.userExpiry[targetUserId]) {
+        botData.userExpiry[targetUserId] = Date.now();
+      }
+      bot.telegram.sendMessage(
+        targetUserId,
+        `⚠️ *تم إلغاء وإتلاف كود الاشتراك الخاص بك من قبل الإدارة.*\n\n🔒 توقفت صلاحية البوت لديك مباشرة.\n\n⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+    }
+  }
+
+  saveData();
+  return ctx.replyWithMarkdown(`✅ تم إتلاف الكود وإلغاء تفعيل المستخدم المرتبط به فوراً بنجاح: \`${code}\``);
+});
+
+bot.on("text", async (ctx, next) => {
+  const text = ctx.message.text.trim();
+  const userId = ctx.from.id.toString();
+  const chatId = ctx.chat.id.toString();
+  const chatType = ctx.chat.type;
+
+  if (chatType === 'private' && userId !== DEVELOPER_ID) {
+    if (!botData.trialsClaimed.includes(userId)) {
+      botData.trialsClaimed.push(userId);
+      saveData();
+    }
+    if (!botData.notifiedUsers.includes(userId)) {
+      botData.notifiedUsers.push(userId);
+      saveData();
+      const userName = ctx.from.first_name || "مستخدم";
+      await bot.telegram.sendMessage(
+        DEVELOPER_ID,
+        `🚨 *شخص جديد دخل إلى البوت لأول مرة!*\n\n👤 الاسم: ${userName}\n🆔 الآيدي: \`${userId}\``,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+    }
+  }
+
+  if (chatType === 'private' && !isUserActive(userId)) {
+    if (text.startsWith("MICHAEL-") || botData.codes[text]) {
+      return processRedeem(ctx, text);
+    }
+  }
+
+  if (chatType === 'private' && botData.botStatus !== "work" && userId !== DEVELOPER_ID) {
+    return ctx.reply(botData.stopMessage, { parse_mode: "Markdown" });
+  }
+
+  if (chatType === 'supergroup' || chatType === 'group' || chatType === 'channel') {
+    if (!isGroupActive(chatId) || botData.disabledGroups.includes(chatId)) {
+      if (/^\/start(?:@[A-Za-z0-9_]+)?$/i.test(text) || /^\/(?:on|off|of|period)(?:@[A-Za-z0-9_]+)?$/i.test(text)) {
+        // السماح بالمرور
+      } else {
+        return;
+      }
+    }
+  }
+
+  if (/^\/on(?:@[A-Za-z0-9_]+)?$/i.test(text)) {
+    if (chatType === 'private') return ctx.reply("⚠️ هذا الأمر خاص بالمجموعات فقط.");
+    const canControl = isDev(userId) || (await isGroupAdmin(ctx));
+    if (!canControl) return ctx.reply("⛔ عذراً عزيزي، هذا الأمر مخصص لمشرفي المجموعة فقط.");
+
+    const idx = botData.disabledGroups.indexOf(chatId);
+    if (idx !== -1) { botData.disabledGroups.splice(idx, 1); saveData(); }
+    return ctx.reply("🟢 تم تشغيل البوت في المجموعة بنجاح!");
+  }
+
+  if (/^\/(?:off|of)(?:@[A-Za-z0-9_]+)?$/i.test(text)) {
+    if (chatType === 'private') return ctx.reply("⚠️ هذا الأمر خاص بالمجموعات فقط.");
+    const canControl = isDev(userId) || (await isGroupAdmin(ctx));
+    if (!canControl) return ctx.reply("⛔ عذراً عزيزي، هذا الأمر مخصص لمشرفي المجموعة فقط.");
+
+    if (!botData.disabledGroups.includes(chatId)) { botData.disabledGroups.push(chatId); saveData(); }
+    return ctx.reply("تم إيقاف البوت في المجموعة بأمر من المشرفين ⚠️");
+  }
+
+  if (/^\/period(?:@[A-Za-z0-9_]+)?$/i.test(text)) {
+    if (chatType === 'private') return ctx.reply("⚠️ هذا الأمر خاص بالمجموعات فقط.");
+    
+    if (userId === DEVELOPER_ID) {
+      if (!isGroupActive(chatId) || botData.disabledGroups.includes(chatId)) {
+        const devExpiredMsg = 
+          `😂⚠️ عزيزي المطور، اشتراك القروب منتهي!\n\n` +
+          `يبدو أن القروب قرر يأخذ إجازة من خدماتنا 😂\n\n` +
+          `اللهم لا شماتة 🤣\n\n` +
+          `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`;
+        return ctx.reply(devExpiredMsg);
+      }
+    } else {
+      const canControl = isDev(userId) || (await isGroupAdmin(ctx));
+      if (!canControl) return ctx.reply("⛔ عذراً عزيزي، هذا الأمر مخصص لمشرفي المجموعة فقط.");
+
+      const insufficientMsg = 
+        `⛔ تنبيه | INSUFFICIENT PERMISSIONS\n\n` +
+        `━━━━━━━━━━━━━━━━━━\n\n` +
+        `⚠️ البوت لا يمتلك الصلاحيات المطلوبة للعمل داخل هذه المجموعة أو أن الاشتراك منتهي.\n\n` +
+        `🛠️ الإجراء المطلوب:\n` +
+        `يرجى التأكد من تفعيل المجموعة لدى المطور.\n\n` +
+        `👨‍💻 المطور: @m4kk6\n\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`;
+
+      if (!isGroupActive(chatId) || botData.disabledGroups.includes(chatId)) {
+        return ctx.reply(insufficientMsg);
+      }
+    }
+
+    const adminName = ctx.from.first_name || (isDev(userId) ? "المطور" : "المشرف");
+    const activationTimeMs = botData.groupActivationTimes[chatId] || Date.now();
+    const expiryTimeMs = botData.groupExpiry[chatId] || (Date.now() + 30 * 24 * 60 * 60 * 1000);
+    
+    const activationDateStr = new Date(activationTimeMs).toLocaleString();
+    const expiryDateStr = new Date(expiryTimeMs).toLocaleString();
+
+    const now = Date.now();
+    const remMs = expiryTimeMs - now;
+
+    let remainingStr = "انتهى الاشتراك";
+    if (remMs > 0) {
+      const days = Math.floor(remMs / (1000 * 60 * 60 * 24));
+      const hours = Math.floor((remMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+      const mins = Math.floor((remMs % (1000 * 60 * 60)) / (1000 * 60));
+      const secs = Math.floor((remMs % (1000 * 60)) / 1000);
+      remainingStr = `${days} يوم و ${hours} ساعة و ${mins} دقيقة و ${secs} ثانية`;
+    }
+
+    const periodMsg = 
+      `👋 أهلاً بك عزيزي ${adminName}.\n\n` +
+      `✅ تم تفعيل مجموعتك في: ${activationDateStr}\n\n` +
+      `🏁 ينتهي الاشتراك في: ${expiryDateStr}\n\n` +
+      `⏳ المتبقي على انتهاء الاشتراك: ${remainingStr}\n\n` +
+      `⚡ MICHAEL ELITE`;
+
+    return ctx.replyWithMarkdown(periodMsg);
+  }
+
+  let cleanText = text;
+  if (/^\/like\d+$/i.test(text)) {
+    cleanText = text.replace(/^\/like/i, '/like ');
+  } else if (/^\/spam\d+$/i.test(text)) {
+    cleanText = text.replace(/^\/spam/i, '/spam ');
+  } else if (/^\/likeauto\d+/.test(text)) {
+    cleanText = text.replace(/^\/likeauto/i, '/likeauto ');
+  } else if (/^\/removeauto\d+/.test(text)) {
+    cleanText = text.replace(/^\/removeauto/i, '/removeauto ');
+  }
+
+  const parts = cleanText.split(/\s+/);
+  const baseCmd = parts[0].split('@')[0].toLowerCase();
+
+  const userPerm = getUserPermission(userId);
+
+  if (baseCmd === '/spam') {
+    if (userPerm === "like") {
+      return ctx.reply("❌ عذراً، لا تمتلك صلاحية استخدام أوامر السبام.");
+    }
+  }
+
+  if (baseCmd === '/like' || baseCmd === '/likeauto' || baseCmd === '/removeauto') {
+    if (userPerm === "spam") {
+      return ctx.reply("❌ عذراً، لا تمتلك صلاحية استخدام أوامر اللايكات.");
+    }
+  }
+
+  if (baseCmd === '/spam' || baseCmd === '/like') {
+    if (chatType === 'private' && !isUserActive(userId) && botData.trialStartTimes[userId] && !isTrialActive(userId)) {
+      return ctx.reply(
+        `⚠️ عذراً عزيزي، أمر إرسال اللايكات في الخاص مخصص للمشتركين فقط.\n\n` +
+        `💎 للاشتراك وإتاحة استخدام البوت في الخاص والمجموعات بلا حدود، تواصل مع المطور:\n` +
+        `@m4kk6\n\n` +
+        `⚡ MICHAEL ELITE`
+      );
+    }
+
+    const targetUid = parts[1];
+    if (!targetUid || !/^\d+$/.test(targetUid)) {
+      return ctx.replyWithMarkdown(`⚠️ *يرجى كتابة الآيدي بجانب الأمر:*\n\`${baseCmd} <uid>\`\n*مثال:* \`${baseCmd} 123456789\``);
+    }
+
+    const globalCheck = checkGlobalTargetCooldown(targetUid);
+    if (globalCheck.limited) {
+      return ctx.replyWithMarkdown(
+        `⚠️ عذراً عزيزي، هذا الآيدي (\`${targetUid}\`) تم زيادة اللايكات له بواسطة البوت خلال الـ 24 ساعة الماضية في أي مكان بالنظام (سواء أوتو أو مجموعات).\n\n` +
+        `🕒 الوقت المتبقي لإعادة استخدامه: *${globalCheck.hours}* ساعة و *${globalCheck.mins}* دقيقة\n\n` +
+        `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏`
+      );
+    }
+
+    if (chatType === 'private' && !isUserActive(userId)) {
+      if (!botData.trialStartTimes[userId]) {
+        botData.trialStartTimes[userId] = Date.now();
+        saveData();
+        await ctx.reply("🎁 تم تفعيل التجربة المجانية لمدة ساعة واحدة، يمكنك إرسال لايكات لأي عدد من الآيديات (بدون تكرار نفس الآيدي).").catch(() => {});
+      }
+    }
+
+    if (chatType !== 'private' && userId !== DEVELOPER_ID) {
+      const insufficientMsg = 
+        `⛔ تنبيه | INSUFFICIENT PERMISSIONS\n\n` +
+        `━━━━━━━━━━━━━━━━━━\n\n` +
+        `⚠️ البوت لا يمتلك الصلاحيات المطلوبة للعمل داخل هذه المجموعة.\n\n` +
+        `🛠️ الإجراء المطلوب:\n` +
+        `يرجى منح البوت الصلاحيات اللازمة، أو التواصل مع المطور للمساعدة.\n\n` +
+        `👨‍💻 المطور: @m4kk6\n\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`;
+      if (!isGroupActive(chatId)) return ctx.reply(insufficientMsg);
+      if (botData.disabledGroups.includes(chatId)) {
+        return ctx.reply("❌ البوت متوقف حالياً في هذه المجموعة.");
+      }
+    }
+
+    if (userId !== DEVELOPER_ID && isUserActive(userId)) {
+      const now = Date.now();
+      let cooldownTime = 2 * 60 * 1000;
+      let lastTime = typeof userLikeCooldowns[userId] === 'object' ? (userLikeCooldowns[userId].time || 0) : (userLikeCooldowns[userId] || 0);
+
+      if (now - lastTime < cooldownTime) {
+        const remainingTime = cooldownTime - (now - lastTime);
+        const minutesLeft = Math.floor(remainingTime / (1000 * 60));
+        const secondsLeft = Math.floor((remainingTime % (1000 * 60)) / 1000);
+        return ctx.replyWithMarkdown(
+          `⏳ عذراً عزيزي، يجب الانتظار لمدة دقيقتين قبل إضافة UID آخر.\n\n` +
+          `🕒 الوقت المتبقي: *${minutesLeft}* دقيقة و *${secondsLeft}* ثانية\n\n` +
+          `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏`
+        );
+      }
+    }
+
+    let waitMsg;
+    try {
+      waitMsg = await ctx.reply(`⏳Please wait... (${targetUid})`);
+    } catch (e) {}
+
+    const startTime = Date.now();
+    try {
+      const result = await enqueueLikeTask(targetUid);
+      const endTime = Date.now();
+      const speed = ((endTime - startTime) / 1000).toFixed(2);
+
+      if (waitMsg) {
+        await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+      }
+      
+      const nickname = result.nickname;
+      const playerLevel = result.playerLevel;
+
+      if (userId !== DEVELOPER_ID && isUserActive(userId)) {
+        if (typeof userLikeCooldowns[userId] !== 'object') {
+          userLikeCooldowns[userId] = {};
+        }
+        userLikeCooldowns[userId].time = Date.now();
+        saveCooldowns();
+      }
+
+      updateGlobalTargetCooldown(targetUid);
+
+      const res =
+        `✅ LIKES SENT SUCCESSFULLY\n\n` +
+        `👤 Player: ${nickname}\n` +
+        `⭐ Level: ${playerLevel}\n` +
+        `🆔 UID: \`${targetUid}\`\n\n` +
+        `📉 Before: \`${result.beforeLikes}\`\n` +
+        `🔥 Likes Given: +${result.addedLikes}\n` +
+        `📈 After: \`${result.afterLikes}\`\n\n` +
+        `🐥 SPEED: ${speed}S`;
+
+      const resImg = (baseCmd === '/spam' && chatType === 'private') ? "https://i.postimg.cc/dVHJwpDz/a51f6398e0626aa6794bc907b596a02e.jpg" : (chatType === 'private' ? "https://i.postimg.cc/nV5s5Zjb/faf0dd7d9902836b17f25863e3927b1a.jpg" : "https://i.postimg.cc/65ndfTjQ/fbaf9f7064c9fce74d65d54f0e039f13.jpg");
+      return ctx.replyWithPhoto(resImg, { caption: res, parse_mode: "Markdown" }).catch(() => ctx.replyWithMarkdown(res));
+
+    } catch (err) {
+      if (waitMsg) {
+        await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+      }
+      if (err.message === "DUPLICATE_UID") {
+        return ctx.reply("⚠️ هذا الآيدي موجود بالفعل في قائمة الانتظار أو قيد المعالجة.");
+      }
+      if (err.message === "QUEUE_FULL") {
+        return ctx.reply("⏳ قائمة الانتظار ممتلئة حالياً، حاول مرة أخرى بعد قليل.");
+      }
+      return ctx.reply("تعذر الحصول على معلومات اللاعب، تأكد من الآيدي وحاول مجدداً 🎯");
+    }
+  }
+
+  if (baseCmd === '/likeauto') {
+    if (chatType !== 'private') return ctx.reply("⚠️ أمر تفعيل الأوتو لايك مخصص للاستخدام في المحادثة الخاصة مع البوت فقط.");
+    if (!isUserActive(userId)) return ctx.reply("⛔ عذرا عزيزي البوت مخصص للمشتركين فقط. \nللاشتراك تواصل مع المطور: \n@m4kk6");
+    
+    const uid = parts[1];
+    const days = parts[2] ? parseInt(parts[2]) : null;
+
+    if (!uid || !/^\d+$/.test(uid) || !days) {
+      return ctx.replyWithMarkdown(
+        "⚠️ *يرجى كتابة الآيدي وعدد الأيام بجانب الأمر (من 2 إلى 10 أيام، بحد أقصى 3 أيديات):*\n" +
+        "`/likeauto <uid> <days>` أو `/likeauto<uid> <days>`\n" +
+        "*مثال:* `/likeauto123456789 5`"
+      );
+    }
+    
+    if (days < 2 || days > 10) {
+      return ctx.reply("❌ عذراً، عدد الأيام غير مسموح به (الحد الأدنى 2 يوم، والحد الأقصى 10 أيام).");
+    }
+
+    const globalCheck = checkGlobalTargetCooldown(uid);
+    if (globalCheck.limited) {
+      return ctx.replyWithMarkdown(
+        `⚠️ عذراً عزيزي، هذا الآيدي (\`${uid}\`) تم زيادة اللايكات له خلال الـ 24 ساعة الماضية عبر المجموعات أو الخاص ولا يمكن تفعيله حالياً.\n\n` +
+        `🕒 الوقت المتبقي لإعادة استخدامه: *${globalCheck.hours}* ساعة و *${globalCheck.mins}* دقيقة\n\n` +
+        `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏`
+      );
+    }
+
+    if (userId !== DEVELOPER_ID) {
+      const now = Date.now();
+      const userExpiry = botData.userExpiry[userId] || now;
+      const remainingMs = userExpiry - now;
+      const requestedMs = days * 24 * 60 * 60 * 1000;
+
+      if (botData.autoLikes[uid] && botData.autoLikes[uid].userId !== userId) {
+        return ctx.reply("❌ هذا الآيدي مفعّل له أوتو لايك من مستخدم آخر.");
+      }
+
+      if (!isAdmin(userId) && botData.userExpiry[userId] && requestedMs > remainingMs) {
+        const userName = ctx.from.first_name || "مستخدم";
+        return ctx.replyWithMarkdown(
+          `عذرا عزيزي ${userName}، مدة الأوتو لايك المطلوبة (${days} أيام) أكبر من الفترة المتبقية لاشتراكك في البوت!\n\n` +
+          `⏳ يرجى اختيار عدد أيام يوافق الفترة المتبقية لاشتراكك، أو تجديد اشتراكك أولاً.\n` +
+          `👨‍💻 للتواصل مع المطور: @m4kk6\n\n` +
+          `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`
+        );
+      }
+
+      const userUids = Object.keys(botData.autoLikes).filter(k => botData.autoLikes[k].userId === userId);
+      
+      if (!userUids.includes(uid)) {
+        if (userUids.length >= 3) {
+          return ctx.reply("❌ عذراً، لقد وصلت إلى الحد الأقصى المسموح به (3 أيديات فقط) لتفعيل الأوتو لايك.");
+        }
+      }
+    }
+
+    let accNickname = "غير معروف";
+    try {
+      const infoRes = await axios.get("http://de26.spaceify.eu:26080/info", { params: { uid: uid }, timeout: 10000 });
+      if (infoRes && infoRes.data && infoRes.data.basicInfo && infoRes.data.basicInfo.nickname) {
+        accNickname = escapeMarkdown(infoRes.data.basicInfo.nickname);
+      }
+    } catch (e) {}
+
+    botData.autoLikes[uid] = { userId: userId, daysLeft: days, lastSent: 0 };
+    saveData();
+
+    const currentCount = Object.keys(botData.autoLikes).filter(k => botData.autoLikes[k].userId === userId).length;
+    const remainingSlots = (userId === DEVELOPER_ID) ? 99 : (3 - currentCount);
+    const uFirstName = ctx.from.first_name || "مستخدم";
+
+    const successAutoMsg = 
+      `╭━━━ ⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀 ━━━╮\n\n` +
+      `🎉 تم تفعيل خدمة AUTO LIKE بنجاح!\n\n` +
+      `👤 الاسم: ${uFirstName}\n` +
+      `اسم الحساب: ${accNickname}\n\n` +
+      `🆔 الآيدي: \`${uid}\`\n` +
+      `⏳ مدة الاشتراك:\n` +
+      `${days} أيام\n\n` +
+      `➕ يمكنك إضافة (${remainingSlots}) آيدي آخر ضمن اشتراكك.\n\n` +
+      `╰━━━━━━━━━━━━━━━━━━━━╯`;
+
+    return ctx.replyWithMarkdown(successAutoMsg);
+  }
+
+  if (baseCmd === '/removeauto') {
+    if (chatType !== 'private') return ctx.reply("⚠️ أمر إيقاف الأوتو لايك مخصص للاستخدام في المحادثة الخاصة مع البوت فقط.");
+    if (!isUserActive(userId)) return ctx.reply("⛔ عذرا عزيزي البوت مخصص للمشتركين فقط. \nللاشتراك تواصل مع المطور: \n@m4kk6");
+    
+    const uid = parts[1];
+    const reduceDays = parts[2] ? parseInt(parts[2]) : null;
+
+    if (!uid || !/^\d+$/.test(uid)) {
+      return ctx.replyWithMarkdown(
+        "⚠️ *يرجى كتابة الآيدي وعدد الأيام بجانب الأمر:*\n" +
+        "`/removeauto <uid> <days>` أو `/removeauto<uid> <days>`\n" +
+        "*مثال:* `/removeauto123456789` أو `/removeauto123456789 2`"
+      );
+    }
+
+    if (botData.autoLikes[uid]) {
+      if (userId !== DEVELOPER_ID && botData.autoLikes[uid].userId !== userId) {
+        return ctx.reply("❌ لا يمكنك إزالة آيدي لم تقم بإضافته!");
+      }
+
+      if (reduceDays !== null) {
+        if (reduceDays < 2 || reduceDays > 7) {
+          return ctx.reply("❌ عذراً، عدد أيام التنقيص غير مسموح به (الحد الأدنى 2 يوم، والحد الأقصى 7 أيام).");
+        }
+
+        if (reduceDays >= botData.autoLikes[uid].daysLeft) {
+          delete botData.autoLikes[uid];
+          saveData();
+          return ctx.replyWithMarkdown(
+            `✅ تم حذف الآيدي بنجاح من قائمة AUTO LIKE.\n\n⚡ MICHAEL ELITE`
+          );
+        } else {
+          botData.autoLikes[uid].daysLeft -= reduceDays;
+          saveData();
+          return ctx.replyWithMarkdown(
+            `✅ حسناً عزيزي، تم إنقاص مدة اشتراك AUTO LIKE بنجاح.\n\n` +
+            `⏳ المدة المخصومة: (${reduceDays}) أيام\n\n` +
+            `⚡ MICHAEL ELITE`
+          );
+        }
+      } else {
+        delete botData.autoLikes[uid];
+        saveData();
+        return ctx.replyWithMarkdown(
+          `✅ تم حذف الآيدي بنجاح من قائمة AUTO LIKE.\n\n⚡ MICHAEL ELITE`
+        );
+      }
+    } else {
+      return ctx.replyWithMarkdown(`⚠️ لا يوجد تفعيل أوتو لايك قائم لهذا الآيدي (\`${uid}\`).`);
+    }
+  }
+
+  return next();
+});
+
+bot.command("addgroup", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ هذا الأمر مخصص للأدمن والمطور فقط.");
+  const parts = ctx.message.text.split(/\s+/);
+  let gInput = parts[1];
+  const uId = parts[2];
+  const durationArg = (parts[3] || "30d").toLowerCase();
+  if (!gInput) return ctx.replyWithMarkdown("⚠️ *الاستخدام الصحيح:*\n`/addgroup <group_id_or_link> [user_id] [duration]`");
+
+  let gId = "";
+  if (/^-?\d+$/.test(gInput)) {
+    gId = gInput;
+  } else {
+    let searchTarget = gInput;
+    if (gInput.includes("t.me/")) {
+      let clean = gInput.split("t.me/")[1];
+      clean = clean.split("?")[0].split("/")[0].trim();
+      searchTarget = clean.startsWith("+") ? clean : (clean.startsWith("@") ? clean : "@" + clean);
+    } else if (!gInput.startsWith("@")) {
+      searchTarget = "@" + gInput;
+    }
+    try {
+      const chatInfo = await ctx.telegram.getChat(searchTarget);
+      gId = chatInfo.id.toString();
+    } catch (e) {
+      return ctx.reply("❌ تعذر جلب آيدي القروب الرقمي. تأكد من أن البوت موجود داخل المجموعة ومشرف فيها.");
+    }
+  }
+
+  let ms = 30 * 24 * 60 * 60 * 1000;
+  let durationDesc = "30 يوم";
+  if (durationArg.endsWith('m')) {
+    const mins = parseInt(durationArg) || 1; ms = mins * 60 * 1000; durationDesc = `${mins} دقائق`;
+  } else if (durationArg.endsWith('h')) {
+    const hours = parseInt(durationArg) || 1; ms = hours * 60 * 60 * 1000; durationDesc = `${hours} ساعات`;
+  } else if (durationArg.endsWith('d') || !isNaN(durationArg)) {
+    const days = parseInt(durationArg) || 1; ms = days * 24 * 60 * 60 * 1000; durationDesc = `${days} يوم`;
+  }
+
+  if (!botData.activeGroups.includes(gId)) botData.activeGroups.push(gId);
+  const nowTime = Date.now();
+  botData.groupActivationTimes[gId] = nowTime;
+  botData.groupExpiry[gId] = nowTime + ms;
+
+  if (botData.groupExpiryNotified) {
+    botData.groupExpiryNotified = botData.groupExpiryNotified.filter(id => id !== gId);
+  }
+  if (uId) {
+    if (!botData.userGroups[uId]) botData.userGroups[uId] = [];
+    if (!botData.userGroups[uId].includes(gId)) botData.userGroups[uId].push(gId);
+  }
+  saveData();
+
+  const safeInput = escapeMarkdown(gInput);
+  
+  if (uId) {
+    const userMsg = 
+      `🎉 مبروك! تم تفعيل مجموعتك بنجاح.\n\n` +
+      `⚡ أصبحت مجموعتك جاهزة لاستخدام خدمات MICHAEL ELITE.\n\n` +
+      `🔗 رابط المجموعة: ${safeInput}\n\n` +
+      `⏳ مدة الاشتراك: ${durationDesc}\n\n` +
+      `💎 شكراً لثقتك بنا!`;
+    await ctx.telegram.sendMessage(uId, userMsg, { parse_mode: "Markdown" }).catch(() => {});
+  }
+
+  const adminMsg = 
+    `✅ تم تفعيل قروب جديد بنجاح وتثبيت الآيدي الرقمي!\n\n` +
+    `🔗 المدخل: ${safeInput}\n` +
+    `🆔 الآيدي الرقمي المحفوظ: \`${gId}\`\n\n` +
+    `⏳ مدة التفعيل: ${durationDesc}.\n\n` +
+    `⚡ MICHAEL ELITE`;
+  return ctx.replyWithMarkdown(adminMsg);
+});
+
+bot.command("remgroup", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ هذا الأمر مخصص للأدمن والمطور فقط.");
+  const parts = ctx.message.text.split(/\s+/);
+  let gInput = parts[1];
+  if (!gInput) return ctx.replyWithMarkdown("⚠️ *الاستخدام الصحيح:*\n`/remgroup <group_id_or_link>`");
+
+  let gId = "";
+  if (/^-?\d+$/.test(gInput)) {
+    gId = gInput;
+  } else {
+    let searchTarget = gInput;
+    if (gInput.includes("t.me/")) {
+      let clean = gInput.split("t.me/")[1];
+      clean = clean.split("?")[0].split("/")[0].trim();
+      searchTarget = clean.startsWith("+") ? clean : (clean.startsWith("@") ? clean : "@" + clean);
+    } else if (!gInput.startsWith("@")) {
+      searchTarget = "@" + gInput;
+    }
+    
+    for (const [id, rec] of Object.entries(botData.groupJoinRecords || {})) {
+      if (rec.username && rec.username.toLowerCase() === searchTarget.toLowerCase()) {
+        gId = id;
+        break;
+      }
+    }
+
+    if (!gId) {
+      try {
+        const chatInfo = await ctx.telegram.getChat(searchTarget);
+        gId = chatInfo.id.toString();
+      } catch (e) {
+        for (const activeId of botData.activeGroups) {
+          if (activeId === gInput || (botData.groupJoinRecords[activeId] && botData.groupJoinRecords[activeId].username.includes(gInput))) {
+            gId = activeId;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (!gId) {
+    return ctx.reply("❌ تعذر العثور على القروب. يرجى استخدام الآيدي الرقمي مباشرة مثل (-100xxxx).");
+  }
+
+  const idx = botData.activeGroups.indexOf(gId);
+  if (idx !== -1) {
+    botData.activeGroups.splice(idx, 1);
+    delete botData.groupExpiry[gId];
+    delete botData.groupActivationTimes[gId];
+    delete botData.groupJoinRecords[gId];
+    
+    for (const [uId, gList] of Object.entries(botData.userGroups || {})) {
+      const gIdx = gList.indexOf(gId);
+      if (gIdx !== -1) {
+        gList.splice(gIdx, 1);
+      }
+    }
+
+    saveData();
+    return ctx.replyWithMarkdown(`🔴 *تم إزالة القروب بنجاح!*`);
+  }
+  
+  return ctx.replyWithMarkdown(`⚠️ القروب غير موجود في قائمة المجموعات النشطة.`);
+});
+
+bot.command("addadmin", async (ctx) => {
+  if (!isDev(ctx.from.id)) return ctx.reply("❌ للمطور فقط.");
+  const uId = ctx.message.text.split(" ")[1];
+  if (!uId) return ctx.reply("⚠️ /addadmin <ID>");
+  
+  let targetName = "المستخدم";
+  try {
+    const chatMember = await ctx.telegram.getChat(uId);
+    targetName = chatMember.first_name || chatMember.title || uId;
+  } catch (e) {}
+
+  if (!botData.admins.includes(uId)) { 
+    botData.admins.push(uId); 
+    saveData(); 
+  }
+
+  await ctx.replyWithMarkdown(
+    `😎 أهلاً بمطوري الفخم ⚡\n\n` +
+    `✅ تم ترقية (${targetName}) إلى رتبة أدمن بنجاح!\n\n` +
+    `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`
+  );
+
+  await bot.telegram.sendMessage(
+    uId,
+    `👑 يا أهلاً وسهلاً بالأدمن الجديد (${targetName})!\n\n` +
+    `✨ نورت بوتنا وزدت MICHAEL ELITE فخامة.\n\n` +
+    `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
+});
+
+bot.command("remadmin", async (ctx) => {
+  if (!isDev(ctx.from.id)) return ctx.reply("❌ للمطور فقط.");
+  const uId = ctx.message.text.split(" ")[1];
+  if (!uId) return ctx.reply("⚠️ /remadmin <ID>");
+  
+  const idx = botData.admins.indexOf(uId);
+  if (idx !== -1 && uId !== DEVELOPER_ID) {
+    let targetName = "المستخدم";
+    try {
+      const chatMember = await ctx.telegram.getChat(uId);
+      targetName = chatMember.first_name || chatMember.title || uId;
+    } catch (e) {}
+
+    botData.admins.splice(idx, 1);
+    saveData();
+
+    await ctx.replyWithMarkdown(
+      `😎 أهلاً بمطوري الفخم ⚡\n\n` +
+      `✅ تم عزل (${targetName}) من رتبة الأدمن بنجاح!\n\n` +
+      `⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀`
+    );
+
+    await bot.telegram.sendMessage(
+      uId,
+      `⛔ تم عزلك من رتبة الأدمن في بوت ⚡ 𝙈𝙄𝘾𝙃𝘼𝙀𝙇 𝙀𝙇𝙄𝙏𝙀\n` +
+      `الرجاء عدم التلاعب ب اي شي`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+
+    return;
+  }
+  return ctx.reply("❌ لا يمكنك إزالة هذا الأدمن.");
+});
+
+bot.command("groups", (ctx) => {
+  const userId = ctx.from.id.toString();
+  const myGroups = botData.userGroups[userId] || [];
+  if (!myGroups.length) return ctx.reply("📌 ليس لديك مجموعات مفعلة خاصة بك.");
+  let txt = "📋 *مجموعاتك المفعلة والوقت المتبقي:*\n\n";
+  for (const gId of myGroups) {
+    const expiry = botData.groupExpiry[gId];
+    if (expiry) {
+      const rem = expiry - Date.now();
+      if (rem > 0) {
+        const daysLeft = Math.floor(rem / (1000 * 60 * 60 * 24));
+        const hoursLeft = Math.floor((rem % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const minsLeft = Math.floor((rem % (1000 * 60 * 60)) / (1000 * 60));
+        txt += `• القروب: \`${gId}\`\n  ⏳ متبقي: ${daysLeft} يوم و ${hoursLeft} ساعة و ${minsLeft} دقيقة\n\n`;
+      } else {
+        txt += `• القروب: \`${gId}\`\n  ❌ *منتهي الصلاحية*\n\n`;
+      }
+    }
+  }
+  return ctx.replyWithMarkdown(txt);
+});
+
+bot.command("users", (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ هذا الأمر مخصص للأدمن والمطور فقط.");
+  return ctx.replyWithMarkdown(`📊 *النظام والبيانات:*\n\n👤 *المستخدمين المفعلين:* Users/\n👥 *المجموعات المفعلة:* Groups/\n🛡️ *الأدمن:* Admin/`);
+});
+
+bot.command("Users", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ هذا الأمر مخصص للأدمن والمطور فقط.");
+  
+  const allUsersSet = new Set([...botData.activeUsers, ...Object.keys(botData.userExpiry || {})]);
+  if (allUsersSet.size === 0) return ctx.reply("📌 لا يوجد مستخدمين مسجلين في البوت حالياً.");
+
+  let txt = "👤 *قائمة المستخدمين (أدمن ومستخدمين عاديين):*\n\n";
+  let count = 1;
+  
+  for (const uId of allUsersSet) {
+    let uName = "مستخدم";
+    try {
+      const chatInfo = await ctx.telegram.getChat(uId);
+      uName = chatInfo.first_name || chatInfo.title || "مستخدم";
+    } catch (e) {}
+
+    const role = isAdmin(uId) ? "🛡️ (أدمن)" : "👤 (عادي)";
+    txt += `${count}. ${uName} ${role}\n   🆔 الآيدي: \`${uId}\`\n\n`;
+    count++;
+    
+    if (txt.length > 3500) {
+      await ctx.replyWithMarkdown(txt);
+      txt = "";
+    }
+  }
+  
+  if (txt.trim()) {
+    await ctx.replyWithMarkdown(txt);
+  }
+});
+
+bot.command("Groups", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ هذا الأمر مخصص للأدمن والمطور فقط.");
+  
+  const allGroupIds = Object.keys(botData.groupJoinRecords || {});
+  if (allGroupIds.length === 0 && botData.activeGroups.length === 0) return ctx.reply("📌 لا توجد مجموعات مسجلة في البوت.");
+
+  const combinedGroups = new Set([...allGroupIds, ...botData.activeGroups]);
+  let txt = "👥 *قائمة المجموعات وحالة تفعيلها:*\n\n";
+  let count = 1;
+
+  for (const gId of combinedGroups) {
+    let gTitle = "مجموعة";
+    if (botData.groupJoinRecords && botData.groupJoinRecords[gId]) {
+      gTitle = botData.groupJoinRecords[gId].title || "مجموعة";
+    } else {
+      try {
+        const chatInfo = await ctx.telegram.getChat(gId);
+        gTitle = chatInfo.title || "مجموعة";
+      } catch (e) {}
+    }
+
+    const active = isGroupActive(gId) && !botData.disabledGroups.includes(gId);
+    const statusText = active ? "✅ مفعلة" : "❌ غير مفعلة / منتهية";
+
+    txt += `${count}. القروب: *${gTitle}*\n   🆔 الآيدي: \`${gId}\`\n   📌 الحالة: ${statusText}\n\n`;
+    count++;
+
+    if (txt.length > 3500) {
+      await ctx.replyWithMarkdown(txt);
+      txt = "";
+    }
+  }
+
+  if (txt.trim()) {
+    await ctx.replyWithMarkdown(txt);
+  }
+});
+
+bot.command("Admin", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("❌ هذا الأمر مخصص للأدمن والمطور فقط.");
+  
+  const adminsList = botData.admins || [];
+  if (adminsList.length === 0) return ctx.reply("📌 لا يوجد أدمن مسجلين.");
+
+  let txt = "🛡️ *قائمة الأدمنية في البوت:*\n\n";
+  let count = 1;
+
+  for (const aId of adminsList) {
+    let aName = "أدمن";
+    try {
+      const chatInfo = await ctx.telegram.getChat(aId);
+      aName = chatInfo.first_name || chatInfo.title || "أدمن";
+    } catch (e) {}
+
+    txt += `${count}. ${aName}\n   🆔 الآيدي: \`${aId}\`\n\n`;
+    count++;
+  }
+
+  return ctx.replyWithMarkdown(txt);
+});
+
+bot.command("id", (ctx) => ctx.replyWithMarkdown(`👤 *الاسم:* ${ctx.from.first_name}\n• آيدي: \`${ctx.from.id}\`\n• آيدي الدردشة: \`${ctx.chat.id}\``));
+
+let autoLikeRunning = false;
+setInterval(async () => {
+  if (autoLikeRunning) return;
+  autoLikeRunning = true;
+  try {
+    if (botData.botStatus !== "work") return;
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    for (const uid of Object.keys(botData.autoLikes || {})) {
+      const entry = botData.autoLikes[uid];
+      if (!entry) continue;
+      const ownerId = String(entry.userId);
+
+      if (ownerId !== DEVELOPER_ID && !isUserActive(ownerId)) {
+        delete botData.autoLikes[uid];
+        saveData();
+        await bot.telegram.sendMessage(ownerId, `⚠️ تم إيقاف AUTO LIKE للآيدي (${uid}) بسبب انتهاء اشتراكك.\n\n⚡ MICHAEL ELITE`).catch(() => {});
+        continue;
+      }
+
+      if (entry.lastSent && Date.now() - entry.lastSent < DAY_MS) continue;
+      if (entry.nextTry && Date.now() < entry.nextTry) continue;
+
+      try {
+        const result = await enqueueLikeTask(uid);
+        entry.lastSent = Date.now();
+        entry.failCount = 0;
+        entry.nextTry = 0;
+        entry.daysLeft -= 1;
+        
+        updateGlobalTargetCooldown(uid);
+
+        const finished = entry.daysLeft <= 0;
+        const daysLeftNow = entry.daysLeft;
+        if (finished) delete botData.autoLikes[uid];
+        saveData();
+
+        await bot.telegram.sendMessage(ownerId,
+          `🤖 AUTO LIKE\n\n` +
+          `👤 Player: ${result.nickname}\n` +
+          `🆔 UID: \`${uid}\`\n` +
+          `📉 Before: \`${result.beforeLikes}\`\n` +
+          `🔥 Likes Given: +${result.addedLikes}\n` +
+          `📈 After: \`${result.afterLikes}\`\n\n` +
+          (finished ? `✅ انتهت مدة AUTO LIKE لهذا الآيدي.\n\n` : `⏳ الأيام المتبقية: ${daysLeftNow}\n\n`) +
+          `⚡ MICHAEL ELITE`,
+          { parse_mode: "Markdown" }
+        ).catch(() => {});
+      } catch (err) {
+        if (err && err.message === "INVALID_UID") {
+          entry.failCount = (entry.failCount || 0) + 1;
+          entry.nextTry = Date.now() + 30 * 60 * 1000;
+          if (entry.failCount >= 3) {
+            delete botData.autoLikes[uid];
+            saveData();
+            await bot.telegram.sendMessage(ownerId, `⚠️ تم حذف الآيدي (${uid}) من AUTO LIKE لأنه غير صالح.\n\n⚡ MICHAEL ELITE`).catch(() => {});
+          } else {
+            saveData();
+          }
+        } else if (err && err.message !== "DUPLICATE_UID" && err.message !== "QUEUE_FULL") {
+          entry.nextTry = Date.now() + 10 * 60 * 1000;
+          saveData();
+        }
+      }
+    }
+  } catch (e) {
+  } finally {
+    autoLikeRunning = false;
+  }
+}, 60 * 1000);
+
+bot.launch().then(() => console.log("Bot running successfully!")).catch(console.error);
